@@ -134,6 +134,7 @@ def check_peer_rules(info, threshold):
 def process_torrent_peers(qbt, torrent_hash, threshold, dry_run, log_file, logger):
     """Fetches and filters peers for a specific torrent execution loop."""
     banned_in_torrent = 0
+    to_ban_list = []
     try:
         peer_data = qbt.sync_torrent_peers(torrent_hash)
         if not peer_data or 'peers' not in peer_data:
@@ -160,12 +161,12 @@ def process_torrent_peers(qbt, torrent_hash, threshold, dry_run, log_file, logge
                 logger.info(f"[BAN] {log_msg}")
                 log_ban_to_tabular_file(log_file, info, reason)
                 try:
-                    qbt.transfer_ban_peers(ip_port)
+                    to_ban_list.append((ip_port, info, reason))
                     banned_in_torrent += 1
                 except Exception as e:
                     logger.error(f"Failed to ban peer {ip_port}: {e}")
                     
-    return banned_in_torrent
+    return to_ban_list
 
 
 def verify_connection(qbt, logger):
@@ -206,21 +207,38 @@ def main():
         sys.exit(1)
 
     consecutive_errors = 0
-
+    
     while True:
         try:
             active_torrents = qbt.torrents_info(status_filter='active')
-            total_banned = 0
-            
+            all_to_ban = []
+
             if active_torrents:
                 for torrent in active_torrents:
-                    total_banned += process_torrent_peers(
+                    all_to_ban += process_torrent_peers(
                         qbt, torrent.hash, args.threshold, args.dry_run, args.log_file, logger
                     )
-                    
-            if total_banned > 0 and not args.dry_run:
-                logger.info(f"Cleanup cycle completed. Total peers banned: {total_banned}")
             
+            if all_to_ban:
+                if not args.dry_run:
+                    ips_string = '|'.join([peer[0] for peer in all_to_ban])
+                    try:
+                        qbt.transfer_ban_peers(peers=ips_string)
+                        
+                        for ip_port, info, reason in all_to_ban:
+                            pure_ip = info.get('ip', ip_port.rsplit(':', 1)[0] if ':' in ip_port else ip_port)
+                            client = info.get('client', 'Unknown')
+                            flags = info.get('flags', 'N/A')
+                            logger.info(f"[BAN] [{reason}] IP: {pure_ip} | Client: {client} | Flags: {flags}")
+                        
+                        logger.info(f"Cleanup cycle completed. Total peers banned: {len(all_to_ban)}")
+                    except Exception as e:
+                        logger.error(f"Failed to execute mass ban: {e}")
+                else:
+                    for ip_port, info, reason in all_to_ban:
+                        logger.info(f"[DRY-RUN] [MATCH] {reason} | IP: {ip_port}")
+                    logger.info(f"[DRY-RUN] Found {len(all_to_ban)} peers to ban.")
+
             consecutive_errors = 0
             
         except Exception as e:
