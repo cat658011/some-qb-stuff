@@ -133,7 +133,6 @@ def check_peer_rules(info, threshold):
 
 def process_torrent_peers(qbt, torrent_hash, threshold, dry_run, log_file, logger):
     """Fetches and filters peers for a specific torrent execution loop."""
-    banned_in_torrent = 0
     to_ban_list = []
     try:
         peer_data = qbt.sync_torrent_peers(torrent_hash)
@@ -162,7 +161,6 @@ def process_torrent_peers(qbt, torrent_hash, threshold, dry_run, log_file, logge
                 log_ban_to_tabular_file(log_file, info, reason)
                 try:
                     to_ban_list.append((ip_port, info, reason))
-                    banned_in_torrent += 1
                 except Exception as e:
                     logger.error(f"Failed to ban peer {ip_port}: {e}")
                     
