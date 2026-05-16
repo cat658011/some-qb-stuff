@@ -6,13 +6,11 @@ import sys
 import time
 import json
 from datetime import datetime
-from pathlib import Path
 
 try:
     import qbittorrentapi
 except ImportError:
     sys.exit("CRITICAL: 'qbittorrentapi' module is not installed. Please run: pip install qbittorrent-api")
-
 
 # ====================== DEFAULT CONFIG ======================
 DEFAULT_CONFIG = {
@@ -24,7 +22,9 @@ DEFAULT_CONFIG = {
     "threshold": 52428800,
     "max_bans_per_cycle": 0,
 
-    "empty_client_mode": "strict",    # strict | smart | disabled
+    "anti_leech": True,      
+    "min_ratio": 0.05,       
+    "empty_client_mode": "strict", # strict | smart | disabled
 
     "block_list": ['xunlei', 'xl00', 'thunder', 'xfwl', 'unknown', 'top-bt', 'torrent+'],
 
@@ -35,7 +35,7 @@ DEFAULT_CONFIG = {
     ],
 
     "whitelist_clients": [
-        "qBittorrent", "Transmission", "Deluge", "rtorrent", "BiglyBT", "PicoTorrent"
+        "qBittorrent", "Transmission", "Deluge", "rtorrent", "BiglyBT", "PicoTorrent", "libtorrent"
     ],
 
     "excluded_labels": ["private", "no-guard", "trusted", "whitelist", "important"]
@@ -45,222 +45,160 @@ DEFAULT_CONFIG = {
 def load_config(config_path):
     if not config_path or not os.path.exists(config_path):
         return DEFAULT_CONFIG.copy()
-
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             loaded = json.load(f)
         config = DEFAULT_CONFIG.copy()
-        config.update(loaded)
-        print(f"Config loaded: {config_path}")
+        config.update(loaded) # Deep override
         return config
     except Exception as e:
-        print(f"Error reading config {config_path}: {e}", file=sys.stderr)
+        print(f"Error reading config: {e}", file=sys.stderr)
         return DEFAULT_CONFIG.copy()
 
 
-def save_default_config(config_path):
+def save_default_config(config_path, config_data):
     if os.path.exists(config_path):
         return
     try:
         with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(DEFAULT_CONFIG, f, indent=4, ensure_ascii=False)
-        print(f"Created example of config file: {config_path}")
-    except Exception:
-        pass
+            json.dump(config_data, f, indent=4, ensure_ascii=False)
+        print(f"Created default config file: {config_path}")
+    except Exception as e:
+        print(f"Failed to create config file: {e}", file=sys.stderr)
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="qBittorrent Peer Guard: Automated anti anti-P2P utility",
+        description="qBittorrent Peer Guard: Automated Anti-Leech & Peer Management Utility",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    parser.add_argument('--config', type=str, default='peer_guard.json',
-                        help='Path to JSON config file (optional)')
+    prot = parser.add_argument_group('Protection Settings')
+    prot.add_argument('--anti-leech', action='store_true', default=None, 
+                      help='Enable aggressive anti-leech protection')
+    prot.add_argument('--threshold', type=int, help='Upload threshold in bytes before ban logic triggers')
+    prot.add_argument('--ratio', type=float, dest='min_ratio', help='Min ratio (DL/UP) required')
 
-    # Connection
-    parser.add_argument('--host', type=str, default=None, help='Override host from config')
-    parser.add_argument('--user', type=str, default=None, help='Override username')
-    parser.add_argument('--pass', dest='password', type=str, default=None, help='Override password')
+    conn = parser.add_argument_group('Connection Settings')
+    conn.add_argument('--host', type=str, help='qBittorrent WebUI host')
+    conn.add_argument('--user', type=str, help='WebUI Username')
+    conn.add_argument('--pass', dest='password', type=str, help='WebUI Password')
 
-    # Operation
-    parser.add_argument('--interval', type=float, default=None, help='Scan interval in seconds')
-    parser.add_argument('--threshold', type=int, default=None, help='Upload threshold in bytes')
-    parser.add_argument('--max-bans-per-cycle', type=int, default=None)
-
-    parser.add_argument('--empty-client-mode', type=str, default=None,
-                        choices=['strict', 'smart', 'disabled'])
-
-    # Logging & Mode
-    parser.add_argument('--log-file', type=str, default=None)
-    parser.add_argument('--silent', action='store_true')
-    parser.add_argument('--dry-run', action='store_true')
+    general = parser.add_argument_group('General')
+    general.add_argument('--config', type=str, default='peer_guard.json', help='Path to config file')
+    general.add_argument('--dry-run', action='store_true', help='Scan and log, but do not actually ban peers')
+    general.add_argument('--log-file', type=str, default='bans.log', help='Path to tabular log file')
 
     return parser.parse_args()
 
 
-def setup_logging(silent):
-    handlers = [] if not silent else [logging.NullHandler()]
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
-        handlers=handlers
-    )
-    return logging.getLogger("PeerGuard")
-
-
 def initialize_tabular_log(file_path):
-    if not file_path or os.path.exists(file_path):
-        return
+    if not file_path or os.path.exists(file_path): return
     try:
         with open(file_path, 'w', encoding='utf-8') as f:
-            header = f"{'DATE TIME':<16} | {'IP':<40} | {'FLAGS':<12} | {'PROG':<6} | {'UPLOADED':<10} | {'DOWNLOADED':<10} | {'REASON':<30} | CLIENT\n"
-            f.write(header)
-            f.write("-" * len(header) + "\n")
+            header = f"{'DATE TIME':<18} | {'IP ADDRESS':<22} | {'PROG':<6} | {'UP (MB)':<8} | {'DOWN (MB)':<9} | {'REASON':<22} | CLIENT\n"
+            f.write(header + "-" * len(header) + "\n")
     except Exception as e:
-        print(f"CRITICAL: Failed to initialize log file: {e}", file=sys.stderr)
+        print(f"Failed to initialize log file: {e}", file=sys.stderr)
 
 
-def log_ban_to_tabular_file(file_path, info, reason):
-    if not file_path:
-        return
+def log_ban_to_file(file_path, ip, info, reason):
+    if not file_path: return
     try:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        ip = info.get('ip', '0.0.0.0')
-        flags = info.get('flags', '').strip()
-        raw_progress = info.get('progress', 0.0)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        raw_progress = float(info.get('progress', 0.0))
         progress_str = f"{raw_progress:.1%}" if raw_progress <= 1.0 else f"{raw_progress}%"
-
-        line = f"{timestamp:<16} | {ip:<40} | {flags:<12} | {progress_str:<6} | " \
-               f"{info.get('uploaded', 0):<10} | {info.get('downloaded', 0):<10} | " \
-               f"{reason:<30} | {info.get('client', '').strip()}\n"
-
+        
+        uploaded_mb = info.get('uploaded', 0) / 1048576
+        downloaded_mb = info.get('downloaded', 0) / 1048576
+        client = info.get('client', 'Unknown').strip()[:30]
+        line = f"{timestamp:<18} | {ip:<22} | {progress_str:<6} | {uploaded_mb:<8.1f} | {downloaded_mb:<9.1f} | {reason:<22} | {client}\n"
         with open(file_path, 'a', encoding='utf-8') as f:
             f.write(line)
     except:
         pass
 
 
-def check_peer_rules(info, config, threshold):
+def check_peer_rules(info, config, is_seeding):
     if not isinstance(info, dict):
         return False, ""
 
     client_name = str(info.get('client', '')).strip()
     client_lower = client_name.lower()
-    flags = str(info.get('flags', ''))
-    progress = float(info.get('progress', 0.0))
     uploaded = int(info.get('uploaded', 0))
-    ip = info.get('ip', '')
+    downloaded = int(info.get('downloaded', 0))
+    progress = float(info.get('progress', 0.0))
+    ip = str(info.get('ip', ''))
+    flags = str(info.get('flags', ''))
 
-    # Whitelist IP
-    if any(ip.startswith(w) for w in config["whitelist_ips"]):
-        return False, ""
+    if any(ip.startswith(w) for w in config["whitelist_ips"]): return False, ""
+    if any(w.lower() in client_lower for w in config["whitelist_clients"]): return False, ""
 
-    # Whitelist Client
-    if any(w.lower() in client_lower for w in config["whitelist_clients"]):
-        return False, ""
-
-    # Block List
     if any(bot_tag in client_lower for bot_tag in config["block_list"]):
         return True, "BLACKLISTED_CLIENT"
 
-    # Empty Client Mode
+    if config.get("anti_leech"):
+        if uploaded > config["threshold"]:
+            if not is_seeding:
+                # Если мы качаем, мы ждем отдачи от других
+                if progress == 0.0:
+                    return True, "LEECH_ZERO_PROGRESS"
+                
+                peer_ratio = downloaded / max(uploaded, 1)
+                if peer_ratio < config.get("min_ratio", 0.05):
+                    return True, "LEECH_LOW_RATIO"
+            else
+                if progress == 0.0 and uploaded > (config["threshold"] * 3):
+                    return True, "LEECH_VAMPIRE"
+
     if not client_name:
         mode = config["empty_client_mode"]
-        if mode == "strict":
+        if mode == "strict": 
             return True, "EMPTY_CLIENT_STRICT"
-        elif mode == "disabled":
-            return False, ""
-        else:  # smart
-            if (progress == 0.0 and uploaded > 3 * 1024 * 1024) or uploaded > threshold * 0.4:
-                return True, "EMPTY_CLIENT_SUSPICIOUS"
-            return False, ""
+        if mode == "smart" and uploaded > (config["threshold"] / 2):
+            return True, "EMPTY_CLIENT_SUSPICIOUS"
 
-    # Excessive upload with zero progress
-    if uploaded > threshold and progress == 0.0:
-        return True, "EXCESSIVE_UPLOAD_ZERO_PROGRESS"
-
-    # Dead PEX / garbage connections
-    is_dead = (progress == 0.0 and uploaded == 0 and 'S' not in flags and ('X' in flags or 'h' in flags))
-    if is_dead:
-        return True, "INACTIVE_PEX_CONN"
+    if progress == 0.0 and uploaded == 0 and downloaded == 0 and 'S' not in flags and ('X' in flags or 'h' in flags):
+        return True, "GHOST_CONNECTION"
 
     return False, ""
-
-
-def process_torrent_peers(qbt, torrent_hash, config, threshold, dry_run, log_file, logger):
-    to_ban_list = []
-    try:
-        peer_data = qbt.sync_torrent_peers(torrent_hash)
-        if not peer_data or 'peers' not in peer_data:
-            return []
-        peers = peer_data['peers']
-    except Exception as e:
-        logger.debug(f"Failed to fetch peers for {torrent_hash[:8]}...: {e}")
-        return []
-
-    for ip_port, info in peers.items():
-        should_ban, reason = check_peer_rules(info, config, threshold)
-
-        if should_ban:
-            pure_ip = info.get('ip', ip_port.rsplit(':', 1)[0] if ':' in ip_port else ip_port)
-            client = info.get('client', 'Unknown')
-            flags = info.get('flags', 'N/A')
-
-            log_msg = f"[{reason}] IP: {pure_ip} | Client: {client} | Flags: {flags}"
-
-            if dry_run:
-                logger.info(f"[DRY-RUN] [MATCH] {log_msg}")
-            else:
-                logger.info(f"[BAN] {log_msg}")
-                log_ban_to_tabular_file(log_file, info, reason)
-                to_ban_list.append((ip_port, info, reason))
-
-    return to_ban_list
-
-
-def verify_connection(qbt, logger):
-    try:
-        qbt.auth_log_in()
-        logger.info(f"Connected to qBittorrent v{qbt.app_version()}")
-        return True
-    except Exception as e:
-        logger.critical(f"Connection failed: {e}")
-        return False
 
 
 def main():
     args = parse_arguments()
     config = load_config(args.config)
-    save_default_config(args.config)
 
-    if args.host:      config["host"] = args.host
-    if args.user:      config["username"] = args.user
-    if args.password:  config["password"] = args.password
-    if args.interval is not None: config["interval"] = args.interval
-    if args.threshold is not None: config["threshold"] = args.threshold
-    if args.max_bans_per_cycle is not None:
-        config["max_bans_per_cycle"] = args.max_bans_per_cycle
-    if args.empty_client_mode:
-        config["empty_client_mode"] = args.empty_client_mode
+    # CLI overrides
+    if args.anti_leech is not None: config["anti_leech"] = args.anti_leech
+    if args.threshold: config["threshold"] = args.threshold
+    if args.min_ratio: config["min_ratio"] = args.min_ratio
+    if args.host: config["host"] = args.host
+    if args.user: config["username"] = args.user
+    if args.password: config["password"] = args.password
 
-    logger = setup_logging(args.silent)
+    save_default_config(args.config, config)
 
-    logger.info("=== qBittorrent Peer Guard started ===")
-    if args.dry_run:
-        logger.info("DRY-RUN MODE ENABLED - no bans will be applied")
+    # Setup Logging
+    logging.basicConfig(
+        level=logging.INFO, 
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    logger = logging.getLogger("PeerGuard")
 
-    if args.log_file:
+    if args.log_file and not args.dry_run:
         initialize_tabular_log(args.log_file)
 
-    qbt = qbittorrentapi.Client(
-        host=config["host"],
-        username=config["username"],
-        password=config["password"]
-    )
+    logger.info(f"=== qBittorrent Peer Guard Started ===")
+    logger.info(f"Mode: {'DRY-RUN' if args.dry_run else 'ACTIVE'} | Anti-Leech: {'ON' if config['anti_leech'] else 'OFF'}")
 
-    if not verify_connection(qbt, logger):
+    qbt = qbittorrentapi.Client(host=config["host"], username=config["username"], password=config["password"])
+    
+    try:
+        qbt.auth_log_in()
+        logger.info(f"Connected to qBittorrent v{qbt.app_version()} (API v{qbt.api_version})")
+    except Exception as e:
+        logger.critical(f"Initial login failed: {e}")
         sys.exit(1)
 
     consecutive_errors = 0
@@ -268,49 +206,71 @@ def main():
     while True:
         try:
             active_torrents = qbt.torrents_info(status_filter='active')
-            all_to_ban = []
-
+            to_ban_ips = set()
             for torrent in active_torrents:
-                torrent_labels = [lbl.lower() for lbl in torrent.get('tags', '').split(',') if lbl]
-                if any(ex_label in torrent_labels for ex_label in config["excluded_labels"]):
+                tags = [t.strip().lower() for t in torrent.get('tags', '').split(',') if t]
+                if any(ex in tags for ex in config["excluded_labels"]):
                     continue
 
-                bans = process_torrent_peers(
-                    qbt, torrent.hash, config, config["threshold"],
-                    args.dry_run, args.log_file, logger
-                )
-                all_to_ban.extend(bans)
+                is_seeding = (torrent.get('progress', 0.0) == 1.0)
 
-            if config["max_bans_per_cycle"] > 0 and len(all_to_ban) > config["max_bans_per_cycle"]:
-                logger.warning(f"Too many bans ({len(all_to_ban)}), limiting to {config['max_bans_per_cycle']}")
-                all_to_ban = all_to_ban[:config["max_bans_per_cycle"]]
-            elif config["max_bans_per_cycle"] == 0:
-                logger.debug("max_bans_per_cycle = 0 → no limit applied")
+                try:
+                    peer_data = qbt.sync_torrent_peers(torrent.hash)
+                    peers = peer_data.get('peers', {})
+                except Exception as e:
+                    logger.debug(f"Failed to fetch peers for torrent {torrent.hash[:8]}: {e}")
+                    continue
 
-            if all_to_ban and not args.dry_run:
-                ips_string = '|'.join([peer[0] for peer in all_to_ban])
-                qbt.transfer_ban_peers(peers=ips_string)
-                logger.info(f"Cleanup cycle completed. Total peers banned: {len(all_to_ban)}")
+                for peer_id, info in peers.items():
+                    should_ban, reason = check_peer_rules(info, config, is_seeding)
+                    
+                    if should_ban:
+                        pure_ip = info.get('ip')
+                        if not pure_ip:
+                            pure_ip = peer_id.split(':')[0] if peer_id.count(':') == 1 else peer_id
+
+                        if pure_ip not in to_ban_ips:
+                            client = info.get('client', 'Unknown').strip()
+                            if args.dry_run:
+                                logger.info(f"[DRY-RUN] Would ban: {pure_ip:<15} | Reason: {reason:<20} | Client: {client}")
+                            else:
+                                logger.warning(f"[BAN] IP: {pure_ip:<15} | Reason: {reason:<20} | Client: {client}")
+                                log_ban_to_file(args.log_file, pure_ip, info, reason)
+                            
+                            to_ban_ips.add(pure_ip)
+
+            if to_ban_ips and not args.dry_run:
+                ban_list = list(to_ban_ips)
+                limit = config.get("max_bans_per_cycle", 0)
+                
+                if limit > 0 and len(ban_list) > limit:
+                    logger.warning(f"Ban list too large ({len(ban_list)}), truncating to {limit} to protect API.")
+                    ban_list = ban_list[:limit]
+
+                qbt.transfer_ban_peers(peers='|'.join(ban_list))
+                logger.info(f"Cycle finished. Applied {len(ban_list)} bans.")
 
             consecutive_errors = 0
 
-        except Exception as e:
-            consecutive_errors += 1
-            retry_delay = min(10 * consecutive_errors, 300)
-            logger.error(f"Cycle error: {e}. Retrying in {retry_delay}s...")
-            time.sleep(retry_delay)
+        except qbittorrentapi.APIConnectionError:
+            logger.error("Connection lost. Attempting to re-authenticate...")
             try:
                 qbt.auth_log_in()
-            except:
-                pass
+                logger.info("Re-authentication successful.")
+            except Exception:
+                pass 
+        except Exception as e:
+            consecutive_errors += 1
+            retry_delay = min(15 * consecutive_errors, 300)
+            logger.error(f"Unexpected error in loop: {e}. Retrying in {retry_delay}s...")
+            time.sleep(retry_delay)
             continue
 
         time.sleep(config["interval"])
-
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nPeer Guard stopped by user.")
+        print("\n[!] Peer Guard stopped by user. Exiting safely.")
         sys.exit(0)
